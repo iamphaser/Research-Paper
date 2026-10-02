@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+K2-18 b: scale-height / mean-molecular-weight estimate from JWST transmission spectra.
+
+Data: Madhusudhan et al. 2023 (ApJL 956, L13), OSF DOI 10.17605/OSF.IO/36DJH
+      (NIRISS SOSS + NIRSpec G395H; low-resolution binned files used for analysis,
+       native-resolution files used for QC only).
+File columns: wavelength (um), bin half-width (um), transit depth (fraction), uncertainty (fraction).
+
+Usage:
+    python k2-18b_analysis.py --data-dir path/to/txt/files --out-dir output
+
+Produces (in --out-dir):
+    K2-18b_combined_lowres_ppm.csv, K2-18b_combined_native_ppm.csv,
+    K2-18b_method_summary.csv, K2-18b_fig1_windows.png
+and prints all numbers quoted in the research note.
+"""
+import argparse
+import os
+
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+# ----------------------------------------------------------------------------
+# Constants (as specified for the note)
+# ----------------------------------------------------------------------------
+RS_KM, RP_KM = 308_900.0, 16_620.0   # stellar / planetary radius [km]
+T_EQ = 255.0                          # equilibrium temperature [K]
+G = 12.3                              # surface gravity [m/s^2]
+KB, MH = 1.38e-23, 1.67e-27           # Boltzmann constant [J/K], H mass [kg]
+NS = (4, 5)                           # assumed number of scale heights
+T_COLD = 140.0                        # upper-atmosphere T from retrievals (120-160 K)
+
+FILES = {
+    "NIRISS SOSS (lowres)": "K2-18b_niriss_soss_lowres.txt",
+    "NIRSpec G395H (lowres)": "K2-18b_nirspec_g395h_lowres.txt",
+    "NIRISS SOSS (native)": "K2-18b_niriss_soss_native.txt",
+    "NIRSpec G395H (native)": "K2-18b_nirspec_g395h_native.txt",
+}
+
+# Method B windows, fixed from nominal band positions and the bin grid
+# BEFORE any amplitude was computed.  feature: (instrument, band, [baselines]) in um
+WINDOWS = {
+    "CH4 1.15": ("SOSS", (1.13, 1.22), [(1.02, 1.11), (1.23, 1.31)]),
+    "CH4 1.4":  ("SOSS", (1.33, 1.47), [(1.23, 1.31), (1.50, 1.60)]),
+    "CH4 1.7":  ("SOSS", (1.63, 1.81), [(1.50, 1.60), (1.84, 2.12)]),
+    "CH4 2.3":  ("SOSS", (2.22, 2.42), [(1.92, 2.15), (2.50, 2.70)]),
+    "CH4 3.3":  ("NIRSpec", (3.22, 3.55), [(2.85, 3.15), (3.60, 3.72)]),
+    "CO2 4.3":  ("NIRSpec", (4.19, 4.40), [(3.83, 4.15), (4.48, 4.70)]),
+}
+
+
+# ----------------------------------------------------------------------------
+# Physics helpers
+# ----------------------------------------------------------------------------
+def scale_height_km(dD_ppm, N):
+    """H = dD * Rs^2 / (2 Rp N), with dD in fractional units; result in km."""
+    return dD_ppm * 1e-6 * RS_KM**2 / (2.0 * RP_KM * N)
+
+
+def mu_from_H(H_km, T=T_EQ):
+    """mu = kB T / (H m_H g), with H converted to metres."""
+    return KB * T / (H_km * 1e3 * MH * G)
+
+
+def result_row(method, feature, inst, dD, sdD):
+    """One output row per N, with linear and exact 1-sigma ranges for mu."""
+    rows = []
+    for N in NS:
+        H = scale_height_km(dD, N)
+        sH = H * sdD / abs(dD)
+        if dD > 0:
+            m = mu_from_H(H)
+            sm = m * sdD / dD
+            lo = m * dD / (dD + sdD)
+            hi = m * dD / (dD - sdD) if dD > sdD else np.inf
+            m_cold = mu_from_H(H, T_COLD)
+        else:
+            m = sm = lo = hi = m_cold = np.nan
+        rows.append(dict(Method=method, Feature=feature, Inst=inst, N=N,
+                         dD_ppm=dD, sig_dD_ppm=sdD, H_km=H, sig_H_km=sH,
+                         mu_255K=m, sig_mu=sm, mu_lo_exact=lo, mu_hi_exact=hi,
+                         mu_140K=m_cold))
+    return rows
+
+
+# ----------------------------------------------------------------------------
+# I/O
+# ----------------------------------------------------------------------------
+def load(data_dir, label):
+    path = os.path.join(data_dir, FILES[label])
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing file: {path}")
+    a = np.loadtxt(path, skiprows=1)          # one header line
+    if a.ndim != 2 or a.shape[1] != 4:
+        raise ValueError(f"Malformed file (expected 4 columns): {path}")
+    df = pd.DataFrame({
+        "Wavelength_um": a[:, 0],
+        "Half_width_um": a[:, 1],
+        "Depth_ppm": a[:, 2] * 1e6,
+        "Uncertainty_ppm": a[:, 3] * 1e6,
+    })
+    df["Instrument"] = label
+    return df
+
+
+def select(df, ranges):
+    """Boolean mask of points whose wavelength lies in any (lo, hi) range."""
+    m = np.zeros(len(df), bool)
+    for lo, hi in ranges:
+        m |= (df.Wavelength_um >= lo) & (df.Wavelength_um <= hi)
+    return m
+
+
+def weighted_mean(depth, sigma):
+    w = 1.0 / sigma**2
+    return (w * depth).sum() / w.sum(), w.sum() ** -0.5
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default=".", help="folder with the four .txt files")
+    ap.add_argument("--out-dir", default="output")
+    ap.add_argument("--n-mc", type=int, default=10_000, help="Monte Carlo realisations")
+    ap.add_argument("--seed", type=int, default=1)
+    args = ap.parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+
+    # ---------------- STEP 1: load + QC ----------------
+    D = {k: load(args.data_dir, k) for k in FILES}
+    print("=== STEP 1: data QC ===")
+    for k, d in D.items():
+        print(f"{k:24s} N={len(d):5d} lambda={d.Wavelength_um.min():.4f}-"
+              f"{d.Wavelength_um.max():.4f} um  NaN={int(d.isna().sum().sum())} "
+              f"monotonic={bool(np.all(np.diff(d.Wavelength_um) > 0))} "
+              f"nonpos_sigma={int((d.Uncertainty_ppm <= 0).sum())}")
+        print(f"    mean depth={d.Depth_ppm.mean():.1f} ppm  "
+              f"std={d.Depth_ppm.std(ddof=1):.1f}  mean sigma={d.Uncertainty_ppm.mean():.1f}")
+
+    S, P = D["NIRISS SOSS (lowres)"], D["NIRSpec G395H (lowres)"]
+    inst_df = {"SOSS": S, "NIRSpec": P}
+
+    for tag, keys in (("lowres", ("NIRISS SOSS (lowres)", "NIRSpec G395H (lowres)")),
+                      ("native", ("NIRISS SOSS (native)", "NIRSpec G395H (native)"))):
+        comb = pd.concat([D[k] for k in keys], ignore_index=True)
+        comb["Instrument"] = comb["Instrument"].str.replace(f" ({tag})", "", regex=False)
+        comb.round(4).to_csv(os.path.join(args.out_dir, f"K2-18b_combined_{tag}_ppm.csv"),
+                             index=False)
+
+    rows = []
+
+    # ---------------- STEP 4: Method A (max - min) ----------------
+    print("\n=== STEP 4: Method A (max - min; biased, kept for comparison) ===")
+    for name, d in (("NIRISS SOSS", S), ("NIRSpec G395H", P)):
+        i, j = d.Depth_ppm.idxmax(), d.Depth_ppm.idxmin()
+        dD = d.Depth_ppm[i] - d.Depth_ppm[j]
+        sd = np.hypot(d.Uncertainty_ppm[i], d.Uncertainty_ppm[j])
+        print(f"{name}: dD = {dD:.2f} +/- {sd:.2f} ppm "
+              f"(max at {d.Wavelength_um[i]:.4f} um, min at {d.Wavelength_um[j]:.4f} um)")
+        rows += result_row("A", "max-min", name, dD, sd)
+
+    dd = rows[0]["dD_ppm"]
+    H4 = scale_height_km(dd, 4)
+    print(f"Worked example (SOSS, N=4): H = {H4:.2f} km, mu = {mu_from_H(H4):.3f}")
+
+    # ---------------- STEP 5: Method B (band vs continuum) ----------------
+    print("\n=== STEP 5: Method B windows (fixed before computing amplitudes) ===")
+    for f, (inst, band, bases) in WINDOWS.items():
+        d = inst_df[inst]
+        nb = int(select(d, [band]).sum())
+        nl = int(select(d, bases).sum())
+        print(f"{f:9s} band {band} -> {nb} pts; baselines {bases} -> {nl} pts")
+
+    print("\n=== STEP 5: Method B results ===")
+    feats = []   # (feature, dD, sigma)
+    for f, (inst, band, bases) in WINDOWS.items():
+        d = inst_df[inst]
+        mb = select(d, [band])
+        ml = select(d, bases)
+        mband, sband = weighted_mean(d.Depth_ppm[mb], d.Uncertainty_ppm[mb])
+        mbase, sbase = weighted_mean(d.Depth_ppm[ml], d.Uncertainty_ppm[ml])
+        dD, sd = mband - mbase, np.hypot(sband, sbase)
+        feats.append((f, dD, sd))
+        print(f"{f:9s} band {mband:8.2f}+/-{sband:5.2f}  base {mbase:8.2f}+/-{sbase:5.2f}  "
+              f"dD = {dD:7.2f} +/- {sd:5.2f} ppm ({dD / sd:.2f} sigma)")
+        rows += result_row("B", f, "NIRISS SOSS" if inst == "SOSS" else "NIRSpec G395H", dD, sd)
+
+    def combine(sub, label, sigma_override=None):
+        x = np.array([s[1] for s in sub])
+        s = np.array([s[2] for s in sub])
+        w = 1.0 / s**2
+        m, sm = (w * x).sum() / w.sum(), w.sum() ** -0.5
+        c2 = ((x - m) ** 2 * w).sum()
+        p = chi2.sf(c2, len(x) - 1)
+        print(f"Combined {label}: dD = {m:.2f} +/- {sm:.2f} ppm ({m / sm:.2f} sigma); "
+              f"chi2 = {c2:.2f}/{len(x) - 1}, p = {p:.3f}")
+        return m, sm
+
+    print()
+    m_all, s_analytic = combine(feats, "all 6 features")
+    combine([f for f in feats if f[0].startswith("CH4")], "5 CH4 features")
+    combine([f for f in feats if f[0] in ("CH4 1.15", "CH4 1.4", "CH4 1.7", "CH4 2.3")],
+            "4 SOSS CH4 features")
+    combine([f for f in feats if f[0] in ("CH4 3.3", "CO2 4.3")], "2 NIRSpec features")
+
+    # ---------------- Monte Carlo (flat-spectrum nulls) ----------------
+    print("\n=== Monte Carlo: flat-spectrum nulls ===")
+    for name, d in (("SOSS", S), ("NIRSpec", P)):
+        s = d.Uncertainty_ppm.values
+        r = (rng.normal(0, 1, (args.n_mc, len(s))) * s)
+        r = r.max(1) - r.min(1)
+        print(f"Method A null, {name}: median max-min = {np.median(r):.1f} ppm "
+              f"(16-84%: {np.percentile(r, 16):.1f}-{np.percentile(r, 84):.1f}); "
+              f"mu(N=4) at median = {mu_from_H(scale_height_km(np.median(r), 4)):.2f}")
+
+    idx = {}
+    for f, (inst, band, bases) in WINDOWS.items():
+        d = inst_df[inst]
+        idx[f] = (np.where(select(d, [band]))[0], np.where(select(d, bases))[0], d)
+
+    def null_combined():
+        # Draw ONE noise realisation per instrument and reuse it for every feature,
+        # so that baseline points shared between features stay correlated.
+        noise = {name: rng.normal(0, 1, len(d)) * d.Uncertainty_ppm.values
+                 for name, d in inst_df.items()}
+        out = []
+        for f, (inst, _, _) in WINDOWS.items():
+            b, bl, d = idx[f]
+            s = d.Uncertainty_ppm.values
+            y = noise[inst]
+            w = 1.0 / s**2
+            mb = (w[b] * y[b]).sum() / w[b].sum()
+            ml = (w[bl] * y[bl]).sum() / w[bl].sum()
+            out.append((mb - ml, np.hypot(w[b].sum() ** -0.5, w[bl].sum() ** -0.5)))
+        x = np.array([o[0] for o in out])
+        w = 1.0 / np.array([o[1] for o in out]) ** 2
+        return (w * x).sum() / w.sum()
+
+    null = np.array([null_combined() for _ in range(args.n_mc)])
+    sigma_adopted = null.std()
+    print(f"Method B null: combined dD scatter = {sigma_adopted:.2f} ppm "
+          f"(analytic {s_analytic:.2f} ppm; correlated baselines)")
+
+    # ---------------- STEP 6: adopted uncertainty + mu table ----------------
+    print(f"\n=== STEP 6: adopted sigma_dD = {sigma_adopted:.2f} ppm "
+          f"({m_all / sigma_adopted:.2f} sigma excess) ===")
+    rows += [dict(r, Method="B-combined (adopted sigma)", Feature="all 6", Inst="mixed")
+             for r in result_row("B", "all 6", "mixed", m_all, sigma_adopted)]
+    print(f"{'T(K)':>5} {'N':>2} {'H (km)':>14} {'mu':>14} {'exact 1-sigma':>16}")
+    for T in (255.0, 160.0, 140.0, 120.0):
+        for N in NS:
+            H = scale_height_km(m_all, N)
+            sH = H * sigma_adopted / m_all
+            mu = mu_from_H(H, T)
+            lo = mu * m_all / (m_all + sigma_adopted)
+            hi = mu * m_all / (m_all - sigma_adopted)
+            print(f"{T:5.0f} {N:2d} {H:7.1f}+/-{sH:4.1f} {mu:7.2f}+/-{mu * sigma_adopted / m_all:4.2f} "
+                  f"{lo:8.2f}-{hi:5.2f}")
+    print(f"Temperature scaling 140/255 = {140 / 255:.3f}")
+
+    pd.DataFrame(rows).round(3).to_csv(
+        os.path.join(args.out_dir, "K2-18b_method_summary.csv"), index=False)
+
+    # ---------------- Geometric depth comparison ----------------
+    geo = (RP_KM / RS_KM) ** 2 * 1e6
+    print(f"\nGeometric depth (Rp/Rs)^2 = {geo:.1f} ppm; mean SOSS {S.Depth_ppm.mean():.1f} "
+          f"(+{S.Depth_ppm.mean() - geo:.1f}), mean NIRSpec {P.Depth_ppm.mean():.1f} "
+          f"(+{P.Depth_ppm.mean() - geo:.1f})")
+
+    # ---------------- Figure 1 ----------------
+    fig, ax = plt.subplots(figsize=(7.5, 4.2), dpi=300)
+    labels_tex = {"CH4 1.15": "CH$_4$ 1.15", "CH4 1.4": "CH$_4$ 1.4", "CH4 1.7": "CH$_4$ 1.7",
+                  "CH4 2.3": "CH$_4$ 2.3", "CH4 3.3": "CH$_4$ 3.3", "CO2 4.3": "CO$_2$ 4.3"}
+    for i, (f, (_, band, bases)) in enumerate(WINDOWS.items()):
+        for lo, hi in bases:
+            ax.axvspan(lo, hi, color="#9ecae1", alpha=0.30, lw=0)
+        ax.axvspan(*band, color="#fdae6b", alpha=0.45, lw=0)
+        ax.text(np.mean(band), 3135, labels_tex[f], ha="center", va="top",
+                fontsize=7, rotation=90 if i < 4 else 0)
+    for d, c, l in ((S, "#1f4e79", "NIRISS SOSS"), (P, "#a63603", "NIRSpec G395H")):
+        ax.errorbar(d.Wavelength_um, d.Depth_ppm, xerr=d.Half_width_um, yerr=d.Uncertainty_ppm,
+                    fmt="o", ms=2.8, lw=0.7, color=c, label=l, zorder=3)
+    ax.axhline(geo, color="k", ls="--", lw=0.8, label="Geometric depth $(R_p/R_*)^2$")
+    ax.set_xlim(0.85, 5.2)
+    ax.set_ylim(2725, 3140)
+    ax.set_xlabel("Wavelength ($\\mu$m)")
+    ax.set_ylabel("Transit depth (ppm)")
+    h, l = ax.get_legend_handles_labels()
+    h += [Patch(color="#fdae6b", alpha=0.6), Patch(color="#9ecae1", alpha=0.5)]
+    l += ["Band window", "Baseline window"]
+    ax.legend(h, l, fontsize=6.5, loc="lower left", ncol=2, frameon=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.out_dir, "K2-18b_fig1_windows.png"))
+    print(f"\nWrote outputs to {args.out_dir}/")
+
+
+if __name__ == "__main__":
+    main()
